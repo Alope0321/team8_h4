@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 
 SERVER_NAME = "CSCI4406-HTTP-Server/1.0"
 RECV_BUF = 65536
-
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".htm":  "text/html; charset=utf-8",
