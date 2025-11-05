@@ -4,7 +4,7 @@
 ## How to run the program:
 Run the command ``` python http_server_conc.py -p [port number] -maxclient 10 -maxtotal 60 --root [root]``` in one terminal, then open another and run: \
 for a single file: \
-``` curl http://localhost:20001/[test file] -o [output] ``` \
+``` curl http://localhost:20001/[test file] -o [output] ``` 
 
 for multiple files: \
 ```curl -s http://localhost:20001/[test files].txt \``` \
