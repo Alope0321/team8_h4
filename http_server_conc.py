@@ -6,8 +6,11 @@ import sys
 import threading
 from datetime import datetime, timezone
 
+# Server identity string and a safe upper bound for socket recv()
 SERVER_NAME = "CSCI4406-HTTP-Server/1.0"
 RECV_BUF = 65536
+# Minimal extension → MIME map so browsers/tools render content correctly. Multipurpose Internet Mail Extension
+# Unknown types fall back to application/octet-stream.
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".htm":  "text/html; charset=utf-8",
@@ -38,15 +41,17 @@ MIME_TYPES = {
     ".o":    "application/octet-stream",
 }
 
-# --- concurrency accounting ---
-total_open_conns = 0
-open_conns_by_client = {}   # dict[str, int]
-acct_lock = threading.Lock()
+# getting into the concurency accounting state
 
-def http_date():
+total_open_conns = 0  # system-wide open connection count
+open_conns_by_client = {}   # dict[str, int] per "client app" open connection count
+acct_lock = threading.Lock()  # protects both counters from race conditions across threads
+
+def http_date(): #Format a Date header in RFC 7231 IMF-fixdate (GMT) form
     now = datetime.now(timezone.utc)
     return now.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
+# Build the HTTP status line for common codes (HTTP/1.0)
 def status_line(code):
     phrases = {
         200: "OK",
@@ -59,24 +64,30 @@ def status_line(code):
     }
     return f"HTTP/1.0 {code} {phrases.get(code, 'Unknown')}\r\n"
 
+# Multipurpose Internet Mail Extension
+# Guess Content-Type from file extension; default to bytes if unknown
 def guess_mime(path):
     _, ext = os.path.splitext(path.lower())
     return MIME_TYPES.get(ext, "application/octet-stream")
 
+# Map a requested URL path to a safe on-disk path under the chosen docroot.
 def safe_path(root, url_path):
     url_path = url_path.split("?")[0].split("#")[0]
+    # appends index.html for "/" or trailing "/"
     if url_path.endswith("/"):
         url_path += "index.html"
     if url_path == "/":
         url_path = "/index.html"
-    normalized = os.path.normpath(url_path.lstrip("/"))
-    full_path = os.path.join(root, normalized)
+    normalized = os.path.normpath(url_path.lstrip("/")) # - strips query/fragment
+    full_path = os.path.join(root, normalized) # - normalizes and prevents path traversal (..)
     real_root = os.path.realpath(root)
     real_path = os.path.realpath(full_path)
     if not real_path.startswith(real_root):
-        return None
+        return None  # deny traversal outside docroot
     return real_path
 
+# Compose and send a full HTTP response (status line + headers + body).
+# Always uses Content-Length and Connection: close (HTTP/1.0 style).
 def send_response(conn, code, headers, body_bytes):
     headers_base = {
         "Date": http_date(),
@@ -91,9 +102,12 @@ def send_response(conn, code, headers, body_bytes):
     resp += "\r\n"
     try:
         conn.sendall(resp.encode("utf-8") + body_bytes)
+    # If the socket is already broken, just bail—this is a best-effort send.
     except Exception:
         pass  # best-effort write for error paths
 
+# Parse the request line and headers from raw bytes up to the first blank line.
+# Returns ("METHOD /path HTTP/1.x", {"header": "value", ...}) or ("", {}) on failure.
 def parse_headers(raw_request_bytes):
     """
     Returns (request_line:str, headers:dict[str,str]).
@@ -117,6 +131,10 @@ def parse_headers(raw_request_bytes):
     except Exception:
         return "", {}
 
+# Build a stable "client app" ID for per-client throttling.
+# Priority:
+#   1) exact X-Client-App header (caller-controlled label)
+#   2) heuristic: (User-Agent, source IP, Host) tuple
 def compute_client_id(addr, headers):
     """
     Client application identity:
@@ -131,6 +149,8 @@ def compute_client_id(addr, headers):
     ip = addr[0] if isinstance(addr, tuple) and len(addr) >= 1 else "ip-unknown"
     return f"heur:{ua}|{ip}|{host}"
 
+# Atomically attempt to admit a connection under both limits.
+# Returns (True, None) if admitted, or (False, "global"/"client") on limit breach.
 def admit_connection(client_id, maxtotal, maxclient):
     """
     Try to reserve a slot globally and in the client's bucket.
@@ -148,6 +168,7 @@ def admit_connection(client_id, maxtotal, maxclient):
         open_conns_by_client[client_id] = current + 1
         return True, None
 
+# Release previously-admitted connection slots safely (no negative counts).
 def release_connection(client_id):
     global total_open_conns, open_conns_by_client
     with acct_lock:
@@ -158,7 +179,10 @@ def release_connection(client_id):
                 del open_conns_by_client[client_id]
             else:
                 open_conns_by_client[client_id] = newv
-
+                
+# Worker thread: handle a single accepted connection.
+# Assumes the accept loop already read an initial chunk (first_chunk) to parse headers
+# and has *already* incremented counters by admitting the connection.
 def handle_client(conn, addr, root, first_chunk):
     client_id = None
     try:
@@ -168,12 +192,12 @@ def handle_client(conn, addr, root, first_chunk):
             send_response(conn, 400, {"Content-Type": "text/plain"}, b"Bad Request\n")
             return
 
-        # Identify client app
+        # Identify client app for logging / release later
         client_id = compute_client_id(addr, headers)
 
         # At this point we were already admitted (counters incremented) in accept loop
 
-        # Parse method and path
+        # Parse method and path, only GET is supported
         try:
             method, path, _ = req_line.split()
         except ValueError:
@@ -195,6 +219,7 @@ def handle_client(conn, addr, root, first_chunk):
         send_response(conn, 200, {"Content-Type": mime}, body)
 
     except Exception as e:
+        # Generic 500 if anything unexpected happens
         msg = f"Internal Server Error: {e}\n".encode()
         send_response(conn, 500, {"Content-Type": "text/plain"}, msg)
     finally:
@@ -203,13 +228,16 @@ def handle_client(conn, addr, root, first_chunk):
         finally:
             if client_id is not None:
                 release_connection(client_id)
-
+                
+# Accept loop: listen for TCP connections, minimally read headers to compute client ID,
+# enforce limits, and hand off admitted sockets to worker threads.
 def run_server(port, root, maxclient, maxtotal):
     # listener
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        # SO_REUSEADDR makes quick restarts less annoying on macOS/Linux
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", port))
-        s.listen(128)
+        s.listen(128)  # allow a decent backlog
         print(f"Concurrent server on http://localhost:{port}/  (root: {os.path.abspath(root)})")
         print(f"Limits: per-client={maxclient}, total={maxtotal}")
 
@@ -266,6 +294,7 @@ def run_server(port, root, maxclient, maxtotal):
                     pass
                 # If we admitted already, handle_client will release in finally.
 
+# CLI entry point: parse flags, validate, and start the accept loop
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CSCI4406 Concurrent HTTP Server")
     parser.add_argument("-p", "--port", type=int, required=True, help="Port to listen on (e.g., 20001)")
@@ -274,10 +303,11 @@ if __name__ == "__main__":
     parser.add_argument("-maxtotal", type=int, required=True, help="Max total concurrent connections")
     args = parser.parse_args()
 
+    # Basic sanity for caps—negative/zero limits make no sense
     if args.maxclient <= 0 or args.maxtotal <= 0:
         print("maxclient and maxtotal must be > 0", file=sys.stderr)
         sys.exit(2)
-
+    # Run the server until Ctrl+C
     try:
         run_server(args.port, args.root, args.maxclient, args.maxtotal)
     except KeyboardInterrupt:
